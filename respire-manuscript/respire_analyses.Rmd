@@ -1,0 +1,637 @@
+---
+title: "respire_analyses"
+author: "Nicola Paul"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+The following document includes:\
+1. Fitting exponential and/or Michaelis-Menten curves to rates as a function of temperature and oxygen\
+2. Fitting models to C-specific respiration as a function of Shannon diversity, evenness, and richness\
+
+# 1. Fitting Michaelis-Menten and exponential curves 
+
+Load packages and files
+
+```{r}
+library(tidyverse)
+library(minpack.lm)
+
+file.path <- "/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Mar2026/"
+file.path2 <- "/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/"
+rates <- read.csv(paste(file.path, "data_input/metadata/respire_rates_for16Smetadata_docfix_20260417.csv", sep = ""), header=TRUE,sep=",")
+
+rates <- rates %>% filter(particle_size != "<10um") # remove "small particle" rates, they are not included in this manuscript
+```
+
+## Modify dataframe
+
+```{r}
+# dataframe should be pivoted long on S (oxy, temp) and V (respiration, bp, etc.)
+rates_mm <- rates %>% 
+  filter(station != "SOLACE-pit", particle_size != "<10um") %>% 
+  pivot_longer(cols = c(aerealCresp, respire.flux, respire.Cresp, cell.resp, aerealBP, BP.POCnorm.d,
+                        BPcell, BGErespire, rateDOC_change_uM.d), 
+               names_to = "v_type", values_to = "v") %>% 
+  pivot_longer(cols = c(temp_insitu_C, O2_insitu_uM), names_to = "S_type", values_to = "S") %>% 
+  select(location, cruise, deploymentID, depth_m, v_type, v, S_type, S) %>% 
+  # remove NA values in S and v:
+  filter(v != "NA", S != "NA")
+
+# including temperature out of curiosity but only using oxygen results in manuscript
+```
+
+## Michaelis-Menten model function
+
+```{r}
+# Function to fit MM to a single group
+fit_mm <- function(df) {
+  tryCatch({
+    # fit <- nls(v ~ (Vmax * S) / (Km + S),
+    #            data = df,
+    #            start = list(Vmax = max(df$v) * 1.2, Km = median(df$S)),
+    #            control = nls.control(maxiter = 100))
+    
+    #nlsLM
+    fit <- nlsLM(v ~ (Vmax * S) / (Km + S),
+             data = df,
+             start = list(Vmax = max(df$v) * 1.2, Km = median(df$S)),
+             lower = c(Vmax = 0, Km = 0),   # constrain to positive values if not looking at DOC change
+             upper = c(Vmax = Inf, Km = Inf))
+    
+    params  <- coef(fit)
+    ci      <- suppressMessages(confint(fit))
+    v_pred  <- predict(fit)
+    
+    # Pseudo-R²
+    ss_res  <- sum((df$v - v_pred)^2)          # residual sum of squares
+    ss_tot  <- sum((df$v - mean(df$v))^2)      # total sum of squares
+    r2      <- 1 - (ss_res / ss_tot)
+    
+    # RMSE - in same units as v, easier to interpret practically
+    rmse    <- sqrt(mean((df$v - v_pred)^2))
+    
+    
+    
+    data.frame(
+      Vmax       = params["Vmax"],
+      Km         = params["Km"],
+      Vmax_lower = ci["Vmax", 1],
+      Vmax_upper = ci["Vmax", 2],
+      Km_lower   = ci["Km", 1],
+      Km_upper   = ci["Km", 2],
+      r2         = r2,
+      rmse       = rmse,
+      AIC        = AIC(fit),
+      n          = nrow(df),
+      converged  = TRUE
+    )
+  }, error = function(e) {
+    message("Fit failed: ", conditionMessage(e))
+    data.frame(Vmax = NA, Km = NA,
+               Vmax_lower = NA, Vmax_upper = NA,
+               Km_lower = NA, Km_upper = NA, r2 = NA, rmse = NA,
+               AIC = NA, n = nrow(df), converged = FALSE)
+  })
+}
+
+# Fit across all group combinations
+rates_mm_results <- rates_mm %>% 
+  group_by(S_type, v_type) %>%
+  group_modify(~ fit_mm(.x)) %>%
+  ungroup() %>%
+  arrange(S_type, v_type)
+
+# check for failed fits
+rates_mm_results %>% filter(!converged)
+
+# save file
+write.table(rates_mm_results, file = paste(file.path, "data_output/michaelis_menten/respire_rates_michaelis-menten-fit_results_",
+                                           Sys.Date(), ".csv", sep = ""),
+            sep = ",", row.names = FALSE)
+```
+
+### Check fit using residuals
+
+```{r}
+# Add residuals to the data
+data_with_resid <- rates_mm %>%
+  group_by(S_type, v_type) %>%
+  mutate(v_pred = {
+    fit <- nlsLM(v ~ (Vmax * S) / (Km + S),
+               start = list(Vmax = max(v) * 1.2, Km = median(S)))
+    predict(fit)
+  },
+  residual = v - v_pred)
+
+# Plot residuals vs S — should look like random scatter around 0
+ggplot(data_with_resid, aes(x = S, y = residual)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_grid(v_type ~ S_type, scales = "free") +
+  theme_bw(base_size = 16) +
+  labs(title = "Residuals vs substrate concentration")
+
+ggsave(filename = paste("residuals_michaelis_menten_respire_rates_", Sys.Date(), ".pdf", sep = ""), 
+       path = paste(file.path, "figures/michaelis_menten/", sep = ""),
+       width = 12, height = 18)
+```
+
+### plot
+
+#### smooth prediction lines
+
+```{r}
+# --- Generate smooth prediction lines for each group ---
+predictions <- rates_mm %>%
+  group_by(S_type, v_type) %>%
+  reframe(
+    S = seq(min(S), max(S), length.out = 200)
+  ) %>%
+  left_join(rates_mm_results %>% select(S_type, v_type, Vmax, Km, rmse), 
+            by = c("S_type", "v_type")) %>%
+  mutate(v_pred = (Vmax * S) / (Km + S))
+
+# confidence intervals
+predictions_ci <- predictions %>%
+  left_join(rates_mm_results %>% select(S_type, v_type, Vmax_lower, Vmax_upper, Km_lower, Km_upper),
+            by = c("S_type", "v_type")) %>%
+  mutate(
+    v_lower = (Vmax_lower * S) / (Km_lower + S),
+    v_upper = (Vmax_upper * S) / (Km_upper + S)
+  )
+
+v_type_plot <- c("BGErespire", "BP.POCnorm.d", "respire.Cresp")
+
+predictions.filtered.o2 <- predictions %>% filter(v_type %in% v_type_plot, S_type == "O2_insitu_uM")
+rates_mm.filtered.o2 <- rates_mm %>% filter(v_type %in% v_type_plot, S_type == "O2_insitu_uM")
+```
+
+#### figure
+
+```{r}
+ggplot() +
+  # RMSE
+  geom_ribbon(data = predictions.filtered.o2,
+              aes(x = S, ymin = v_pred - rmse, ymax = v_pred + rmse), alpha = 0.08) +
+  # Raw data points
+  geom_point(data = rates_mm.filtered.o2, aes(x = S, y = v, fill = location), 
+             size = 3, shape = 21) +
+  # Fitted lines
+  geom_line(data = predictions.filtered.o2, aes(x = S, y = v_pred),
+            linewidth = 0.8, linetype = "solid") +
+  facet_wrap(~ v_type, scales = "free_y") +
+  labs(
+    x = "Oxygen (µM)",
+    y = "Rate",
+    color = "Location"
+  ) +
+  #xlim(0, 300) +
+  scale_fill_manual(values = c("orange2", "#D1C4E9", "#E15759", "navy", "#6B6B6B"
+                               , "#DAB6AF")) +
+  theme_classic(base_size = 18) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    #legend.position = "bottom",
+    #panel.grid = element_blank()
+  )
+
+ggsave(filename = paste("michaelis_menten_o2_respire_rates_", Sys.Date(), ".pdf", sep = ""), 
+       path = paste(file.path, "figures/michaelis_menten/", sep = ""),
+       width = 14, height = 4)
+```
+
+## Exponential line fits
+
+Load packages
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyverse)
+library(nls.multstart)
+```
+
+### Set up dataframe
+```{r}
+# dataframe should be pivoted long on S (oxy, temp) and V (respiration, bp, etc.)
+rates_exp <- rates %>% 
+  filter(station != "SOLACE-pit", particle_size != "<10um") %>% 
+  pivot_longer(cols = c(aerealCresp, respire.flux, respire.Cresp, cell.resp, aerealBP, BP.POCnorm.d,
+                        BPcell, BGErespire, rateDOC_change_uM.d), 
+               names_to = "v_type", values_to = "v") %>% 
+  pivot_longer(cols = c(temp_insitu_C, O2_insitu_uM), names_to = "S_type", values_to = "S") %>% 
+  select(location, cruise, deploymentID, depth_m, v_type, v, S_type, S) %>% 
+  # remove NA values in S and v:
+  filter(v != "NA", S != "NA")
+```
+
+### Eppley curve fit
+```{r}
+# --- Eppley curve ---
+# v = a * exp(0.0633 * S)
+# The exponent is fixed from Eppley (1972) - derived from a
+# compilation of marine phytoplankton growth rates across temperatures.
+# Only 'a' (the scaling coefficient) is estimated from the data.
+# Other forms of exponential curve fits were tested; however, none resulted in any fits to the data (this included a free exponent instead of fixed exponent)
+
+
+fit_eppley <- function(df) {
+  tryCatch({
+    
+    # Single parameter model - very stable, simple starting value
+    fit <- nls(v ~ a * exp(0.0633 * S),
+               data    = df,
+               start   = list(a = min(df$v)),
+               control = nls.control(maxiter = 200))
+    
+    params <- coef(fit)
+    ci     <- suppressMessages(confint(fit))
+    v_pred <- predict(fit)
+    
+    ss_res <- sum((df$v - v_pred)^2)
+    ss_tot <- sum((df$v - mean(df$v))^2)
+    r2     <- 1 - (ss_res / ss_tot)
+    rmse   <- sqrt(mean((df$v - v_pred)^2))
+    
+    Q10_implied <- exp(0.0633 * 10)             # Q10 check = 1.88, close to standard Q10 = 2
+    
+    data.frame(
+      a            = params["a"],
+      a_lower      = ci["a", 1],
+      a_upper      = ci["a", 2],
+      exponent     = 0.0633,                   # this value is fixed, don't change
+      Q10_implied  = Q10_implied,
+      r2           = r2,
+      rmse         = rmse,
+      AIC          = AIC(fit),
+      n            = nrow(df),
+      converged    = TRUE,
+      model        = "Eppley"
+    )
+  }, error = function(e) {
+    message("Eppley fit failed: ", conditionMessage(e))
+    data.frame(a = NA, a_lower = NA, a_upper = NA,
+               exponent = 0.0633, Q10_implied = NA,
+               r2 = NA, rmse = NA, AIC = NA,
+               n = nrow(df), converged = FALSE, model = "Eppley")
+  })
+}
+
+# --- Apply across all groups ---
+results_eppley <- rates_exp %>%
+  filter(S_type == "temp_insitu_C") %>%
+  group_by(v_type) %>%
+  group_modify(~ fit_eppley(.x)) %>%
+  ungroup() %>%
+  arrange(v_type)
+
+print(results_eppley, n = Inf)
+
+# save file
+write.table(results_eppley, file = paste(file.path, "data_output/exponential/respire_rates_exponential-fit_eppley_results_",
+                                           Sys.Date(), ".csv", sep = ""),
+            sep = ",", row.names = FALSE)
+```
+
+### Plot
+```{r}
+predictions_eppley <- rates_exp %>%
+  filter(S_type == "temp_insitu_C") %>%
+  group_by(v_type) %>%
+  reframe(S = seq(min(S), max(S), length.out = 200)) %>%
+  left_join(results_eppley_free %>% select(v_type, a, rmse, r2),
+            by = c("v_type")) %>%
+  mutate(v_pred = a * exp(0.0633 * S))
+
+ggplot() +
+  geom_ribbon(data = predictions_eppley %>% filter(v_type == "respire.Cresp" | 
+                                           v_type == "BP.POCnorm.d"),
+              aes(x = S, ymin = v_pred - rmse, ymax = v_pred + rmse), alpha = 0.08) +
+  geom_point(data = rates_exp %>% filter(S_type == "temp_insitu_C", v_type == "respire.Cresp" | 
+                                           v_type == "BP.POCnorm.d"),
+             aes(x = S, y = v, fill = location),
+             size = 3, shape = 21) +
+  geom_line(data = predictions_eppley %>% filter(v_type == "respire.Cresp" | 
+                                           v_type == "BP.POCnorm.d"),
+            aes(x = S, y = v_pred),
+            linewidth = 0.8, linetype = "longdash") +
+  facet_wrap(~v_type, scales = "free_y") +
+   scale_fill_manual(values = c("orange2", "#D1C4E9", "#E15759", "navy", "#6B6B6B"
+                               , "#DAB6AF")) +
+  #scale_color_brewer(palette = "Set1") +
+  labs(x = "Temperature (°C)", y = "Rate",
+       fill = "",
+       title = "Eppley curve fits (exponent fixed at 0.0633)") +
+   theme_classic(base_size = 15) +
+  theme(
+    strip.background = element_rect(fill = "grey90"),
+    strip.text       = element_text(face = "bold")
+  )
+
+ggsave(filename = paste("exponential_temp_eppley-free_respire_rates_", Sys.Date(), ".pdf", sep = ""), 
+       path = paste(file.path, "figures/exponential/", sep = ""),
+       width = 9, height = 4)
+```
+
+# Model fits to C-resp as a function of diversity metrics
+Load packages
+```{r}
+library(bbmle)
+library(boot)
+library(tidyverse)
+```
+
+## Set up dataframe
+```{r}
+richness2 <- richness %>% 
+  filter(sample_type == "respire", particle_size != "<10um") %>% # select only respire data and remove small particle CliOMZ traps
+  mutate(trapID = paste(cruise, deploymentID, depth_m, sep = "_")) %>% # create trapID unique to each trap and deployment
+  distinct(trapID, .keep_all = TRUE) %>% 
+  filter(!trapID %in% div.outliers) %>% # remove outliers as determined in the "barplots" script
+  select(location, trapID, mean_shannon, Evenness, Observed, respire.Cresp, CtoN.respire, CtoN.STT) %>%  # select columns of interest
+  rename(R = respire.Cresp,
+         Shannon = mean_shannon)
+
+# if updated richness.simple is already loaded:
+richness.simple <- richness.simple %>% rename(Shannon = mean_shannon)
+
+richness.analysis <- richness.simple %>% select(location, Shannon, Evenness, Observed, R, CtoN.respire, CtoN.STT)
+
+# save dataframe
+write.table(richness.simple, file = paste(file.path, "data_output/richness-simple_respire_", Sys.Date(), ".csv", sep = ""), sep = ",", row.names = FALSE)
+```
+
+## Definte different models to test:
+```{r}
+set.seed(24)
+
+diversity_metrics <- c("Shannon", "Evenness", "Observed")
+
+f_power   <- function(D, c, alpha)       c * D^alpha
+f_exp     <- function(D, c, beta)        c * exp(beta * D)
+f_linear  <- function(D, a, b)           a + b * D
+f_sat     <- function(D, Rmax, K)        Rmax * D / (K + D)
+f_hump    <- function(D, a, b, cc)       a + b * D + cc * D^2
+f_loglin  <- function(D, a, b)           a + b * log(D)
+```
+
+## Create function to fit and plot all model types across each diversity metric
+```{r}
+run_diversity_analysis <- function(metric_name, data) {
+ 
+  cat("\n============================================================\n")
+  cat("Diversity metric:", metric_name, "\n")
+  cat("============================================================\n")
+ 
+  d <- data.frame(D = data[[metric_name]], R = data$R)
+ 
+  ## --- Fit diff model types ---
+  fit_power <- tryCatch(
+    nls(R ~ f_power(D, c, alpha), data = d,
+        start = list(c = mean(d$R), alpha = -0.5)),
+    error = function(e) NULL
+  )
+ 
+  fit_exp <- tryCatch(
+    nls(R ~ f_exp(D, c, beta), data = d,
+        start = list(c = mean(d$R), beta = -0.05)),
+    error = function(e) NULL
+  )
+ 
+  fit_linear <- lm(R ~ D, data = d)
+ 
+  ## Rmax > 0, K > 0 (using algorithm = "port")
+  fit_sat <- tryCatch(
+    nls(R ~ f_sat(D, Rmax, K), data = d,
+        start = list(Rmax = max(d$R) * 1.5, K = median(d$D)),
+        algorithm = "port",
+        lower = c(Rmax = 1e-8, K = 1e-8)),
+    error = function(e) NULL
+  )
+ 
+  if (!is.null(fit_sat) && coef(fit_sat)["K"] < 1e-6) {
+    cat("  NOTE: constrained sat fit for", metric_name,
+        "pinned K near its lower bound — the data may not actually\n")
+    cat("  support a sensible (positive, non-trivial) saturation curve;\n")
+    cat("  treat 'sat' as a fragile winner if it tops the AIC table.\n")
+  }
+ 
+  fit_hump <- lm(R ~ D + I(D^2), data = d)
+ 
+  fit_loglin <- tryCatch(
+    nls(R ~ f_loglin(D, a, b), data = d,
+        start = list(a = mean(d$R), b = -0.1)),
+    error = function(e) NULL
+  )
+ 
+  model_list <- list(
+    power   = fit_power,
+    exp     = fit_exp,
+    linear  = fit_linear,
+    sat     = fit_sat,
+    hump    = fit_hump,
+    loglin  = fit_loglin
+  )
+  model_list <- model_list[!sapply(model_list, is.null)]
+ 
+  ## --- AIC/BIC comparison for model fit
+  aic_tab <- data.frame(
+    model = names(model_list),
+    AIC   = sapply(model_list, AIC),
+    BIC   = sapply(model_list, BIC),
+    k     = sapply(model_list, function(m) attr(logLik(m), "df"))
+  )
+  aic_tab$deltaAIC <- aic_tab$AIC - min(aic_tab$AIC)
+  aic_tab <- aic_tab[order(aic_tab$deltaAIC), ]
+  aic_tab$weight <- exp(-0.5 * aic_tab$deltaAIC) /
+    sum(exp(-0.5 * aic_tab$deltaAIC))
+ 
+  print(aic_tab)
+ 
+  ## plot both regular scale and log-log scale
+  D_seq <- seq(min(d$D), max(d$D), length.out = 200)
+ 
+  par(mfrow = c(1, 2))
+ 
+  plot(d$D, d$R, pch = 16, col = rgb(0,0,0,0.5),
+       xlab = metric_name, ylab = "Carbon-normalized respiration",
+       main = paste("Raw scale:", metric_name))
+  if (!is.null(fit_power))  lines(D_seq, predict(fit_power,  newdata = data.frame(D = D_seq)), col = "red",    lwd = 2)
+  if (!is.null(fit_exp))    lines(D_seq, predict(fit_exp,    newdata = data.frame(D = D_seq)), col = "blue",   lwd = 2)
+  if (!is.null(fit_sat))    lines(D_seq, predict(fit_sat,    newdata = data.frame(D = D_seq)), col = "green",  lwd = 2)
+  lines(D_seq, predict(fit_linear, newdata = data.frame(D = D_seq)), col = "orange", lwd = 2, lty = 2)
+  legend("topright", legend = c("power", "exponential", "saturating", "linear"),
+         col = c("red","blue","green","orange"), lty = c(1,1,1,2), lwd = 2, bty = "n", cex = 0.7)
+ 
+  plot(log(d$D), log(d$R), pch = 16, col = rgb(0,0,0,0.5),
+       xlab = paste0("log(", metric_name, ")"), ylab = "log(Respiration)",
+       main = paste("Log-log:", metric_name))
+  if (!is.null(fit_power)) lines(log(D_seq), log(predict(fit_power, newdata = data.frame(D = D_seq))),
+                                  col = "red", lwd = 2)
+ 
+  par(mfrow = c(1,1))
+ 
+  # confidence interval
+  boot_ci <- NULL
+  if (!is.null(fit_power)) {
+    boot_alpha <- function(data_in, indices) {
+      dd <- data_in[indices, ]
+      fit <- tryCatch(
+        nls(R ~ f_power(D, c, alpha), data = dd,
+            start = list(c = mean(dd$R), alpha = -0.5)),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) return(NA)
+      coef(fit)["alpha"]
+    }
+ 
+    boot_out <- boot(d, boot_alpha, R = 2000)
+    boot_ci  <- tryCatch(boot.ci(boot_out, type = "perc"), error = function(e) NULL)
+ 
+    cat("\nPower-law exponent (alpha) for", metric_name, ":\n")
+    cat("  Point estimate:", coef(fit_power)["alpha"], "\n")
+    if (!is.null(boot_ci)) {
+      cat("  95% bootstrap CI:", boot_ci$percent[4], "to", boot_ci$percent[5], "\n")
+    } else {
+      cat("  Bootstrap CI failed to compute (check convergence across resamples)\n")
+    }
+  }
+ 
+  list(aic_table = aic_tab, models = model_list, boot_ci = boot_ci)
+}
+```
+
+## Run function for each diversity metric
+```{r}
+results <- lapply(diversity_metrics, run_diversity_analysis, data = richness.analysis)
+names(results) <- diversity_metrics
+```
+
+## Identify the best model
+```{r}
+cat("\n============================================================\n")
+cat("Summary across diversity metrics\n")
+cat("============================================================\n")
+ 
+summary_tab <- do.call(rbind, lapply(diversity_metrics, function(m) {
+  best <- results[[m]]$aic_table[1, ]
+  data.frame(metric = m, best_model = best$model, deltaAIC_next = NA_real_,
+             weight = round(best$weight, 3))
+}))
+print(summary_tab)
+```
+
+## Plot (Fig. 7)
+```{r}
+library(patchwork)
+set.seed(18)
+
+# smooth prediction lines
+f_power  <- function(D, c, alpha) c * D^alpha
+f_exp    <- function(D, c, beta)  c * exp(beta * D)
+f_loglin <- function(D, a, b)     a + b * log(D)
+ 
+get_prediction_band <- function(metric_name, df_in, results_list, n_boot = 500, n_points = 200) {
+ 
+  best_name  <- as.character(results_list[[metric_name]]$aic_table$model[1])
+  best_model <- results_list[[metric_name]]$models[[best_name]]
+ 
+  d <- data.frame(D = df_in[[metric_name]], R = df_in$R)
+  D_seq <- seq(min(d$D), max(d$D), length.out = n_points)
+ 
+  ## Point estimate curve
+  pred_point <- switch(best_name,
+    power  = predict(best_model, newdata = data.frame(D = D_seq)),
+    exp    = predict(best_model, newdata = data.frame(D = D_seq)),
+    loglin = predict(best_model, newdata = data.frame(D = D_seq)),
+    linear = predict(best_model, newdata = data.frame(D = D_seq)),
+    hump   = predict(best_model, newdata = data.frame(D = D_seq)),
+    stop("Unsupported model type for plotting: ", best_name)
+  )
+  # bootstrap calculations to determine 95% confidence interval for plotting
+  boot_preds <- matrix(NA_real_, nrow = n_boot, ncol = n_points)
+ 
+  for (b in seq_len(n_boot)) {
+    idx <- sample(seq_len(nrow(d)), nrow(d), replace = TRUE)
+    db <- d[idx, ]
+ 
+    fit_b <- tryCatch({
+      switch(best_name,
+        power  = nls(R ~ f_power(D, c, alpha), data = db,
+                     start = as.list(coef(best_model))),
+        exp    = nls(R ~ f_exp(D, c, beta), data = db,
+                     start = as.list(coef(best_model))),
+        loglin = nls(R ~ f_loglin(D, a, b), data = db,
+                     start = as.list(coef(best_model))),
+        linear = lm(R ~ D, data = db),
+        hump   = lm(R ~ D + I(D^2), data = db)
+      )
+    }, error = function(e) NULL)
+ 
+    if (!is.null(fit_b)) {
+      boot_preds[b, ] <- tryCatch(
+        predict(fit_b, newdata = data.frame(D = D_seq)),
+        error = function(e) NA_real_
+      )
+    }
+  }
+ 
+  lower <- apply(boot_preds, 2, quantile, probs = 0.025, na.rm = TRUE)
+  upper <- apply(boot_preds, 2, quantile, probs = 0.975, na.rm = TRUE)
+ 
+  list(
+    data = d,
+    best_name = best_name,
+    curve = data.frame(D = D_seq, R = pred_point, lower = lower, upper = upper)
+  )
+}
+ 
+# consistent theme across plots
+pub_theme <- theme_classic(base_size = 12, base_family = "Helvetica") +
+  theme(
+    axis.line       = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks      = element_line(linewidth = 0.4, color = "black"),
+    axis.text       = element_text(color = "black"),
+    plot.title      = element_text(size = 12, face = "plain", hjust = 0),
+    panel.grid      = element_blank(),
+    legend.position = "none"
+  )
+
+r_axis_label <- expression(paste("C-specific respiration (d"^-1, ")"))
+ 
+metric_labels <- c(Shannon = "Shannon diversity",
+                    Evenness = "Evenness",
+                    Observed = "ASV richness")
+
+build_panel <- function(metric_name, df_in, results_list, panel_letter) {
+ 
+  band <- get_prediction_band(metric_name, df_in, results_list)
+ 
+  ggplot() +
+    geom_ribbon(data = band$curve, aes(x = D, ymin = lower, ymax = upper),
+                alpha = 0.4, color = "black", linetype = "dotdash", fill = "lightgrey", linewidth = 0.8) +
+    geom_line(data = band$curve, aes(x = D, y = R),
+              color = "black", linewidth = 0.8) +
+    geom_point(data = band$data, aes(x = D, y = R, fill = df_in$location),
+               shape = 21, size = 3, color = "black", alpha = 0.85) +
+    labs(x = metric_labels[metric_name], y = expression(paste("C-specific respiration (d"^-1, ")"))) +
+    scale_fill_manual(values = c("orange2", "#D1C4E9", "#E15759", "navy", "#DAB6AF")) +
+    pub_theme
+}
+ 
+panels <- Map(build_panel,
+              diversity_metrics,
+              MoreArgs = list(df_in = richness.analysis, results_list = results),
+              panel_letter = c("A", "B", "C"))
+ 
+fig1 <- wrap_plots(panels, nrow = 1)
+ 
+print(fig1)
+ 
+## Save at publication resolution (adjust size/units to target journal specs)
+ggsave(filename = paste("diversity_respiration_fits_", Sys.Date(), ".pdf", sep = ""),
+       path = paste(file.path, "/figures/div_v_resp/", sep = ""), fig1, width = 10, height = 3.4, units = "in")
+  
+```
+
