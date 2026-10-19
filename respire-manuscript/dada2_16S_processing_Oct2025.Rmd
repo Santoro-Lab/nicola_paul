@@ -1,0 +1,402 @@
+---
+title: "16Spipeline_ND1_kelp"
+author: "Nicola Paul"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 16S rRNA gene amplicon sequence data processing pipeline
+
+Last updated: 10/23/2025 to include SR1919 water column samples
+
+This R Markdown document includes the steps for QCing and analyzing 16S data from EXPORTS, SOLACE, SR1919, and CliOMZ (AT50-10) particle (PIT and RESPIRE) and water column samples
+
+Steps are summarized as follows:\
+-dada2 processing pipeline\
+-phyloseq\
+-dada2 output cleanup, calculate relative abundances\
+-calculate and plot alpha & beta diversity\
+-plot relative abundances and determine top ASVs\
+
+For more details, see: <https://benjjneb.github.io/dada2/tutorial.html>
+
+## dada2 pipeline
+
+Before starting, create a folder containing all of the fastq files that you will be working with. Within that folder, create an empty folder named 'filtered'. Make sure there is a separate directory saved containing a COPY of all of the fastq files from your sequencing run that you will never directly work with.
+
+Load libaries and set up file path.
+
+```{r}
+library(dada2)
+library(tidyverse)
+library(ShortRead)
+
+path <- "/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_input/bulk_res_wc_EXP-SOL-SR19-CLZ_fastq"
+
+file_path <- "/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025"
+```
+
+Store the names of fwd and rv files as lists; check that number of R1 = number of R2 files in the vectors. Store the names of all samples in sample.names and set location for filtered fastq files to be saved
+
+```{r}
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_S"), `[`, 1)
+filt_path <- file.path(path, "filtered")
+```
+
+Inspect read quality profiles. Visualize the quality profiles of the forward and reverse reads. In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+```{r echo=TRUE}
+plotQualityProfile(fnFs[201:204]) # forward reads. can change numbers to inspect different samples & # of samples
+plotQualityProfile(fnRs[201:204]) # reverse reads
+```
+
+Filter and trim
+
+```{r}
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq"))
+for(i in seq_along(fnFs)) {
+  fastqPairedFilter(c(fnFs[i], fnRs[i]), c(filtFs[i], filtRs[i]),
+                    truncLen=c(240,150), # cut forward at 240bp and reverse at 150bp, this is standard
+                    maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                    compress=TRUE, verbose=TRUE, matchIDs=TRUE)
+}
+```
+
+#### Dereplication
+
+Dereplication combines all identical sequences into one unique sequence, keeping track of the number of identical sequences
+
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+#### Infer sequence variants
+
+Infer the sequence variants in each sample, taking out the sequence variants that have excessive error rates. Good to make sure nothing is running on your computer that takes up a lot of memory if you run this chunk locally.
+
+Here, we are applying the error models to the data:
+
+```{r}
+dadaFs.lrn <- dada(derepFs, err=NULL, selfConsist = TRUE, multithread=TRUE) # this takes a while when selfConsist = TRUE and there are a lot of samples
+errF <- dadaFs.lrn[[1]]$err_out
+dadaRs.lrn <- dada(derepRs, err=NULL, selfConsist = TRUE, multithread=TRUE)
+errR <- dadaRs.lrn[[1]]$err_out
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+Visualize estimated error rates if desired:
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+```
+
+Merge the overlapping reads (this will also decrease the number of sequence variants). If you had hits of the reverse complement, you can trim here by adding trimOverhang = T.
+
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+```
+
+Construct a sequence table of the samples that is analogous to the "OTU table" produced by classical methods.
+
+```{r}
+seqtab <- makeSequenceTable(mergers[names(mergers) != "Mock"])
+```
+
+Check the distribution of sequence lengths.
+
+```{r}
+dim(seqtab)
+table(nchar(getSequences(seqtab)))
+```
+
+#### Remove Chimeras
+
+Chimeras are artifact sequences formed by two or more biological sequences incorrectly joined together and can occur during PCR reactions using mixed templates (i.e. uncultured environmental samples)
+
+Remove chimeras and check the proportion of sequences that are not chimeras
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=TRUE)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+```{r}
+t.seqtab.nochim <- t(seqtab.nochim)
+asv_seqs <- rownames(t.seqtab.nochim)
+asv_headers <- vector(dim(t.seqtab.nochim)[1], mode="character")
+for (i in 1:dim(t.seqtab.nochim)[1]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+```
+
+#### Assign Taxa
+
+Assign taxonomy using a reference database (Silva database). This can be downloaded from:
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim,
+                       "~/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_input/reference_database/silva_nr99_v138.2_toGenus_trainset.fa.gz")
+unname(head(taxa))
+```
+
+#### Track reads through the pipeline
+
+Final check of progress. Can look at the number of reads that made it through each step in the pipeline. Outside of filtering, there should be no step in which a majority of reads are lost. If a majority of reads failed to merge, you may need to revisit the truncLen parameter used in the filtering step and make sure that the truncated reads span your amplicon. If a majority of reads were removed as chimeric, you may need to revisit the removal of primers, as the ambiguous nucleotides in unremoved primers interfere with chimera identification.
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen = c(240, 150), maxN = 0, 
+                     maxEE = c(2,2), truncQ = 2, 
+                     rm.phix = TRUE, compress = TRUE)
+
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+
+Save data tables from different steps in the dada2 pipeline process:
+
+```{r}
+
+write(asv_fasta, "~/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output/dada2/EXPORTS_Oct2025_ASVs.fasta")
+
+write.table(cbind(t(seqtab.nochim) , taxa), 
+            file = paste("~/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output/dada2/EXPORTS_Oct2025_16S_seqtab-nochimtaxa_", Sys.Date(), ".txt", sep = ""), 
+            sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+
+write.table(taxa,
+            file = paste("~/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output/dada2/EXPORTS_Oct2025_16S_taxa_", Sys.Date(), ".txt", sep = ""), 
+            sep="\t", row.names=TRUE, col.names=NA, quote=FALSE)
+
+```
+
+Summary of plots from dada2 pipeline & code to save them as pdf files:
+
+```{r}
+pdf(file = paste(file_path, "/figures/dada2/ReadQualityProfiles_Forward_", Sys.Date(), ".pdf", sep = ""))
+plotQualityProfile(fnFs[100:103])
+graphics.off()
+
+pdf(file = paste(file_path, "/figures/dada2/ReadQualityProfiles_Reverse_", Sys.Date(), ".pdf", sep = ""))
+plotQualityProfile(fnRs[100:103])
+graphics.off()
+
+pdf(file = paste(file_path, "/figures/dada2/ErrorCheck_Forward_", Sys.Date(), ".pdf", sep = ""))
+plotErrors(errF, nominalQ=TRUE)
+graphics.off()
+
+```
+
+## dada2 output clean up
+
+Clean up of the raw dada2 output data. R script modified from jacqui_dada_output_cleanup.R
+
+Load packages:
+
+```{r}
+library(vegan)
+library(ggplot2)
+library(phyloseq)
+library(tidyverse)
+library(rlang)
+```
+
+Read in files:
+
+```{r}
+setwd("/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output")
+file_path <- "/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/"
+
+count_tab <- read.table("dada2/EXPORTS_Oct2025_16S_seqtab-nochimtaxa_2025-10-23.txt", header=TRUE,sep="\t",row.names=1, na.strings = "NOPE")
+tax_tab <- read.table("dada2/EXPORTS_Oct2025_16S_taxa_2025-10-23.txt", header=TRUE,sep="\t",row.names=1,na.strings = "NOPE")
+meta <- read.csv("~/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_input/metadata/exports_solace_sr19_clz_16Smetadata_v6_20251023.csv",
+                 header=TRUE,sep=",")
+
+count_tab <- count_tab %>% # make sure sample names match with metadata
+  rename_with(~str_replace(., 'WC.2', 'WC_2')) %>%
+  rename_with(~str_replace(., 'WC.3', 'WC_3')) %>% 
+  rename_with(~str_replace(., '.NLP', '_NLP')) # for SR1919 water column samples
+  
+
+```
+
+### Keeping eukaryotes, chloroplasts, and mitochondria
+
+If not removing any of the aforementioned groups, assign the data to ASV_nochl.mit.euk or TAX_nochl.mit.euk to keep consistent with the naming throughout the rest of the code, despite the label of "nochl.mit.euk"
+
+```{r}
+ASV_nochl.mit.euk <- count_tab
+TAX_nochl.mit.euk <- tax_tab
+```
+
+### Remove eukaryotes, chloroplasts, and mitochondria
+
+```{r}
+ASV_nochl <- count_tab %>% filter(Order !="Chloroplast" & Family != "Cyanobiaceae") 
+TAX_nochl <- tax_tab %>% filter(Order !="Chloroplast" & Family != "Cyanobiaceae")
+ASV_nochl.mit <- ASV_nochl %>% filter(Family !="Mitochondria")
+TAX_nochl.mit <- TAX_nochl %>% filter(Family !="Mitochondria")
+ASV_nochl.mit.euk <- ASV_nochl.mit %>% filter(Kingdom !="Eukaryota")
+TAX_nochl.mit.euk <- as.matrix(TAX_nochl.mit %>% filter(Kingdom !="Eukaryota"))
+```
+
+Save tables with or without chloroplasts, mitochondria, and eukaryotes
+
+```{r}
+write.csv(ASV_nochl.mit.euk, file= paste(file_path, "data_output/dada2_cleanup/EXPORTS-Oct2025_seqtab-nochimtaxa_NoChlMitEuk_", 
+                                         Sys.Date(), ".csv", sep = ""), row.names=T)
+write.csv(TAX_nochl.mit.euk, file=paste(file_path, "data_output/dada2_cleanup/EXPORTS-Oct2025_taxa_NoChlMitEuk_", 
+                                        Sys.Date(), ".csv", sep = ""), row.names=T)
+```
+
+```{r}
+ASV <- ASV_nochl.mit.euk[,1:(ncol(ASV_nochl.mit.euk)-6)] # minus 6 bc the last 6 columns are kpcofg
+rarecurve.plot <- rarecurve(ASV, step = 1000, col = "blue", label=F, xlim=c(0,20000))
+rarecurve.plot
+
+# close plot before closing the script (reopening with the plot may cause RStudio to freeze :( )
+```
+
+Save rarefaction curve as pdf file
+This part will take forever and can sometimes cause RStudio to freeze, so I'm commenting it out for now. Would be better to screenshot and save that.
+```{r echo=FALSE}
+# pdf(file = paste(file_path, "data_output/December2024/dada2_cleanup/sbb-trap_Dec2024_rarefaction_curve_", Sys.Date(), ".pdf", sep = ""))
+# rarecurve.plot
+# graphics.off()
+```
+
+Create phyloseq object and rarefy samples based on rarefaction curve. Adjust the number of reads based on the rarefaction curve (where # of species levels out)
+
+```{r}
+OTU <- otu_table(ASV, taxa_are_rows = TRUE)
+TAX <- tax_table(as.matrix(TAX_nochl.mit.euk))
+phy <- phyloseq(OTU,TAX)
+
+set.seed(5000)
+rar <- rarefy_even_depth(phy, sample.size = 5000)
+ASV_rar <- rar@otu_table
+TAX_rar <- rar@tax_table
+```
+
+
+Look at distrubution of read counts for all samples from phyloseq object
+
+```{r}
+
+# Make a data frame with a column for the read counts of each sample
+sample_sum_df <- data.frame(sum = sample_sums(phy))
+# Histogram of sample read counts
+ggplot(sample_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "#377EB8", binwidth = 1000) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank()) +
+  theme_bw()
+
+# mean, max and min of sample read counts
+summary(sample_sum_df)
+```
+
+Save histogram of read counts
+
+```{r}
+ggsave(filename = paste("EXPORTS-Oct2025_readcountdist_", Sys.Date(), ".pdf", sep = ""), # save most recent plot
+       path = paste(file_path, "data_output/dada2_cleanup/", sep = ""),
+       width = 8, height = 6)
+```
+
+### Create an ASV table of counts only (not relative abundances)
+
+Note: edit file name to include "no" or yes to ChlMitEuk
+
+```{r}
+setwd("/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output/dada2_cleanup/")
+
+ASV_rar.df <- as.data.frame(ASV_rar)
+head(ASV_rar.df)
+
+single.forasv <- rowSums(ASV_rar[,1:ncol(ASV_rar)]) > 1 # remove singletons
+NoSingle.forasv <- as.data.frame(ASV_rar[single.forasv,])
+
+ASV_rar.row <- as.data.frame(rownames(NoSingle.forasv))
+
+colnames(ASV_rar.row) <- "ASV"
+
+TAX_rar.df <- as.data.frame(TAX_rar)
+write.csv(TAX_rar.df, file = paste("EXPORTS-Oct2025_taxa_rar5000_NoChlMitEuk_", 
+                                   Sys.Date(), ".csv", sep = ""), row.names = TRUE)
+
+TAX_rar.df$ASV <- rownames(TAX_rar.df)
+taxa.forasv <- inner_join(TAX_rar.df, ASV_rar.row, by = "ASV")
+
+# need to get metadata df to have same samples as ASV and taxa dfs
+sample.forasv <- as.data.frame(colnames(ASV_rar))
+colnames(sample.forasv) <- "Sample"
+sample.forasv <- sample.forasv %>% # should contain same number of names as no singles dataframe
+  filter(!grepl("EVEN", Sample)) %>% 
+  filter(!grepl("STAG", Sample)) %>% 
+  filter(!grepl("NEG", Sample))
+
+
+# write csv files
+write.csv(ASV_rar.df, file = paste("EXPORTS-Oct2025_counts_seqtab-nochimtaxa_rar5000_NoSingle_NoChlMitEuk_", Sys.Date(), ".csv",
+                                   sep = ""), row.names = TRUE) # ASV table with counts, not relative abundance
+
+write.csv(taxa.forasv, file = paste("EXPORTS-Oct2025_taxa_rar5000_NoSingle_NoChlMitEuk_", Sys.Date(), ".csv", sep = ""), row.names = TRUE)
+```
+
+### Create ASV table with relative abundances
+
+```{r}
+#setwd("/Users/npaul/Desktop/Santoro_Lab/Projects/EXPORTS/N Atl/16S/NA 16S R-studio/data_output/December2024/")
+
+ASV_rar_prop <- apply(ASV_rar, 2, function(x) x/sum(x)*100)
+
+#remove singletons (1/5000*100=0.02%)
+single <- rowSums(ASV_rar_prop[,1:ncol(ASV_rar_prop)]) > 0.02
+ASV_NoSingle <- as.data.frame(ASV_rar_prop[single,])
+
+#Remove singletons from rarefied taxonomy file
+ASVrow <- as.data.frame(rownames(ASV_NoSingle))
+colnames(ASVrow) <- "ASV"
+taxa_rar <- as.data.frame(TAX_rar)
+taxa_rar$ASV <- rownames(taxa_rar)
+taxa_NoSingle <- inner_join(taxa_rar,ASVrow, by="ASV")
+
+#create trimmed/rarefied metadata table
+sample_rar <- as.data.frame(colnames(ASV_NoSingle))
+colnames(sample_rar) <- "Sample"
+sample_rar <- sample_rar %>% 
+  filter(!grepl("EVEN", Sample)) %>% 
+  filter(!grepl("STAG", Sample)) %>% 
+  filter(!grepl("NEG", Sample))
+
+
+meta <- meta %>% mutate(Sample = DNA_SampleID)
+meta_all <- full_join(sample_rar,meta, by= "Sample")
+meta_rar <- inner_join(sample_rar, meta, by="Sample") # unmatched rows should not be included
+```
+
+Write ASV files
+
+```{r}
+setwd("/Users/npaul/Desktop/Santoro_Lab/Projects/all_RESPIRE/chapter2-R/Oct2025/data_output/dada2_cleanup/")
+
+write.csv(taxa_NoSingle, file=paste("EXPORTS-Oct2025_taxa_rar5000_NoSingle_NoChlMitEuk_", Sys.Date(), ".csv", sep = ""))
+write.csv(ASV_NoSingle, file=paste("EXPORTS-Oct2025_seqtab-nochimtaxa_rar5000_NoSingle_NoChlMitEuk_", Sys.Date(), ".csv", sep = ""))
+write.csv(meta_rar, file=paste("EXPORTS-Oct2025_meta_rar5000_NoSingle_NoChlMitEuk_", Sys.Date(), ".csv", sep = ""))
+```
